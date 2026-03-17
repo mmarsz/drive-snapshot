@@ -119,10 +119,14 @@ def cmd_snapshot(args):
     print(f"Escaneando: {mount}")
     print(f"Label: {label}")
 
+    # Callback para erros de acesso durante os.walk (ex.: nomes não-UTF-8 em NTFS/exFAT)
+    def walk_error(err):
+        print(f"\n  AVISO: não foi possível acessar: {err.filename} ({err})", file=sys.stderr)
+
     # Primeira passada: contar arquivos para barra de progresso
     print("Contando arquivos...", end="", flush=True)
     file_list = []
-    for root, dirs, filenames in os.walk(mount):
+    for root, dirs, filenames in os.walk(mount, onerror=walk_error):
         for fname in filenames:
             fpath = os.path.join(root, fname)
             if os.path.isfile(fpath) and not os.path.islink(fpath):
@@ -153,23 +157,24 @@ def cmd_snapshot(args):
             stat = os.stat(fpath)
             size = stat.st_size
             mtime = stat.st_mtime
-        except (PermissionError, OSError):
+
+            # Path relativo ao mount point
+            relpath = os.path.relpath(fpath, mount)
+
+            # Hash (pula arquivos enormes >4GB com flag, mas faz por padrão)
+            if args.no_hash:
+                sha = None
+            else:
+                sha = hash_file(fpath)
+                if sha:
+                    hashed += 1
+
+            total_size += size
+            batch.append((snap_id, relpath, size, mtime, sha))
+        except (UnicodeDecodeError, OSError):
+            # Ignora arquivos com nomes/conteúdo não-decodificável ou inacessíveis
             skipped += 1
             continue
-
-        # Path relativo ao mount point
-        relpath = os.path.relpath(fpath, mount)
-
-        # Hash (pula arquivos enormes >4GB com flag, mas faz por padrão)
-        if args.no_hash:
-            sha = None
-        else:
-            sha = hash_file(fpath)
-            if sha:
-                hashed += 1
-
-        total_size += size
-        batch.append((snap_id, relpath, size, mtime, sha))
 
         if len(batch) >= batch_size:
             db.executemany(
@@ -548,7 +553,7 @@ def cmd_mount(args):
                 raise FuseOSError(errno.ENOENT)
             # Retorna zeros para não confundir aplicações que tentam ler
             remaining = max(0, node["size"] - offset)
-            return b"\x00" * min(size, remaining)
+            return b"\x00" * min(size, remaining, 65536)  # limita a 64KB por chamada para evitar OOM em arquivos grandes (ex: 4GB)
 
         def rename(self, old, new):
             with self.lock:
@@ -738,6 +743,25 @@ def cmd_pending(args):
         print()
 
 
+def _validate_path(mount_real, relpath):
+    """Valida que relpath não escapa de mount_real (prevenção de path traversal).
+
+    Junta mount_real com relpath, resolve symlinks/.. via realpath e confirma
+    que o resultado ainda está contido dentro de mount_real.
+
+    Levanta ValueError se o caminho resolvido escapar do diretório base.
+    """
+    # Resolve o caminho base uma vez para comparação consistente
+    base = os.path.realpath(mount_real)
+    # lstrip garante que caminhos absolutos sejam tratados como relativos,
+    # evitando que os.path.join ignore o base quando relpath começa com '/'
+    resolved = os.path.realpath(os.path.join(base, relpath.lstrip("/")))
+    # O separador no final evita falso positivo: /mnt/foo não deve casar com /mnt/foobar
+    if not resolved.startswith(base + os.sep) and resolved != base:
+        raise ValueError(f"path escapa do mount: {relpath!r}")
+    return resolved
+
+
 def cmd_apply(args):
     db = get_db()
     snap = db.execute("SELECT * FROM snapshots WHERE id = ?", (args.snapshot_id,)).fetchone()
@@ -750,8 +774,17 @@ def cmd_apply(args):
         print(f"Erro: '{mount_real}' não é um diretório válido.", file=sys.stderr)
         sys.exit(1)
 
+    # Ordena por prioridade de tipo (mkdir antes de move, delete antes de rmdir)
+    # para garantir que diretórios sejam criados antes de mover arquivos para dentro deles
     rows = db.execute(
-        "SELECT * FROM pending_ops WHERE snapshot_id = ? ORDER BY created_at",
+        """SELECT * FROM pending_ops WHERE snapshot_id = ?
+           ORDER BY CASE op_type
+             WHEN 'mkdir'  THEN 1
+             WHEN 'move'   THEN 2
+             WHEN 'delete' THEN 3
+             WHEN 'rmdir'  THEN 4
+             ELSE 5
+           END, created_at""",
         (args.snapshot_id,),
     ).fetchall()
 
@@ -766,8 +799,6 @@ def cmd_apply(args):
     # Preview
     for r in rows:
         if r["op_type"] == "move":
-            src = os.path.join(mount_real, r["src_path"])
-            dst = os.path.join(mount_real, r["dst_path"])
             print(f"  MOVER: {r['src_path']} → {r['dst_path']}")
         elif r["op_type"] == "delete":
             print(f"  DELETAR: {r['src_path']}")
@@ -777,6 +808,11 @@ def cmd_apply(args):
             print(f"  REMOVER DIR: {r['src_path']}")
 
     print()
+    # Modo dry-run: exibe o preview e sai sem executar nem pedir confirmação
+    if args.dry_run:
+        print("Modo --dry-run: nenhuma operação executada.")
+        return
+
     confirm = input("Aplicar? [s/N] ")
     if confirm.lower() != "s":
         print("Cancelado.")
@@ -786,27 +822,59 @@ def cmd_apply(args):
 
     ok = 0
     erros = 0
+    conflitos = 0  # destino já existe antes do move
     for r in rows:
         try:
             if r["op_type"] == "mkdir":
-                target = os.path.join(mount_real, r["src_path"])
+                # Valida src_path antes de criar diretório
+                try:
+                    target = _validate_path(mount_real, r["src_path"])
+                except ValueError:
+                    print(f"ERRO: path inválido (escapa mount): {r['src_path']}")
+                    erros += 1
+                    continue
                 os.makedirs(target, exist_ok=True)
                 print(f"  OK mkdir: {r['src_path']}")
             elif r["op_type"] == "move":
-                src = os.path.join(mount_real, r["src_path"])
-                dst = os.path.join(mount_real, r["dst_path"])
+                # Valida src_path e dst_path antes de mover
+                try:
+                    src = _validate_path(mount_real, r["src_path"])
+                    dst = _validate_path(mount_real, r["dst_path"])
+                except ValueError:
+                    # Reporta qual dos dois caminhos disparou a violação
+                    print(f"ERRO: path inválido (escapa mount): {r['src_path']} → {r['dst_path']}")
+                    erros += 1
+                    continue
+                # Proteção contra sobrescrita silenciosa: se o destino já existe,
+                # aborta a operação e registra como conflito
+                if os.path.exists(dst):
+                    print(f"  CONFLITO: destino já existe: {r['dst_path']} (pulando)")
+                    conflitos += 1
+                    continue
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.move(src, dst)
                 print(f"  OK move: {r['src_path']} → {r['dst_path']}")
             elif r["op_type"] == "delete":
-                target = os.path.join(mount_real, r["src_path"])
+                # Valida src_path antes de deletar arquivo
+                try:
+                    target = _validate_path(mount_real, r["src_path"])
+                except ValueError:
+                    print(f"ERRO: path inválido (escapa mount): {r['src_path']}")
+                    erros += 1
+                    continue
                 if os.path.isfile(target):
                     os.remove(target)
                     print(f"  OK delete: {r['src_path']}")
                 else:
                     print(f"  SKIP (não encontrado): {r['src_path']}")
             elif r["op_type"] == "rmdir":
-                target = os.path.join(mount_real, r["src_path"])
+                # Valida src_path antes de remover diretório
+                try:
+                    target = _validate_path(mount_real, r["src_path"])
+                except ValueError:
+                    print(f"ERRO: path inválido (escapa mount): {r['src_path']}")
+                    erros += 1
+                    continue
                 if os.path.isdir(target):
                     os.rmdir(target)
                     print(f"  OK rmdir: {r['src_path']}")
@@ -821,7 +889,7 @@ def cmd_apply(args):
     db.execute("DELETE FROM pending_ops WHERE snapshot_id = ?", (args.snapshot_id,))
     db.commit()
 
-    print(f"\nConcluído: {ok} ok, {erros} erros.")
+    print(f"\nConcluído: {ok} ok, {erros} erros, {conflitos} conflitos.")
 
 
 def cmd_delete(args):
@@ -899,6 +967,7 @@ def main():
     p = sub.add_parser("apply", help="Aplica operações pendentes no drive real")
     p.add_argument("snapshot_id", type=int)
     p.add_argument("mount_path", help="Ponto de montagem REAL do drive")
+    p.add_argument("--dry-run", action="store_true", help="Mostra o preview sem executar nada")
 
     # delete
     p = sub.add_parser("delete", help="Remove um snapshot")
