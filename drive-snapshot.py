@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -99,10 +100,6 @@ def get_db():
             status TEXT DEFAULT 'complete'
         )
     """)
-    # Migração: adiciona coluna status em bancos antigos que não a possuem
-    cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)").fetchall()}
-    if "status" not in cols:
-        db.execute("ALTER TABLE snapshots ADD COLUMN status TEXT DEFAULT 'complete'")
     db.execute("""
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +127,15 @@ def get_db():
     """)
     db.commit()
     return db
+
+
+def _migrate_db(db):
+    """Executa migrações de schema pendentes (chamado uma vez no startup)."""
+    # Verifica se a coluna status existe em bancos criados antes desta versão
+    cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)").fetchall()}
+    if "status" not in cols:
+        db.execute("ALTER TABLE snapshots ADD COLUMN status TEXT DEFAULT 'complete'")
+        db.commit()
 
 
 # --- Helpers ---
@@ -167,6 +173,17 @@ def fmt_time(ts):
 
 # --- Commands ---
 
+
+@dataclass
+class _ScanState:
+    """Estado mutável compartilhado durante o scan de arquivos."""
+    total_size: int = 0
+    hashed: int = 0
+    skipped: int = 0
+    batch: list = field(default_factory=list)
+    interrupted: bool = False
+
+
 def cmd_snapshot(args):
     logger = logging.getLogger("drive-snapshot")
     mount = os.path.abspath(args.path)
@@ -187,6 +204,24 @@ def cmd_snapshot(args):
                 label = detected
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass  # lsblk não disponível, usa fallback
+    # Fix 4A: lsblk falha em subdiretórios — resolve o mount point real com findmnt
+    if not label:
+        try:
+            # findmnt retorna o ponto de montagem exato do dispositivo que contém o caminho
+            mount_result = subprocess.run(
+                ['findmnt', '-no', 'TARGET', '--target', mount],
+                capture_output=True, text=True, timeout=5,
+            )
+            mount_point = mount_result.stdout.strip() or mount
+            result = subprocess.run(
+                ['lsblk', '-no', 'LABEL', mount_point],
+                capture_output=True, text=True, timeout=5,
+            )
+            detected = result.stdout.strip()
+            if detected:
+                label = detected
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # findmnt ou lsblk não disponíveis
     if not label:
         label = os.path.basename(mount) or mount
     print(f"Escaneando: {mount}")
@@ -230,6 +265,17 @@ def cmd_snapshot(args):
                 "SELECT path FROM files WHERE snapshot_id = ?", (snap_id,)
             ).fetchall()
         }
+        # Fix 2A: carrega totais já acumulados para não zerar ao retomar
+        existing_stats = db.execute(
+            "SELECT COUNT(*) as cnt, COALESCE(SUM(size), 0) as total FROM files WHERE snapshot_id = ?",
+            (snap_id,)
+        ).fetchone()
+        initial_size = existing_stats["total"]
+        # Conta hashes já computados (sha256 não-nulo)
+        initial_hashed = db.execute(
+            "SELECT COUNT(*) as cnt FROM files WHERE snapshot_id = ? AND sha256 IS NOT NULL",
+            (snap_id,)
+        ).fetchone()["cnt"]
         print(f"  Retomando snapshot #{snap_id} ({len(already_scanned)} arquivos já escaneados)")
         logger.info(f"Retomando snapshot #{snap_id} com {len(already_scanned)} arquivos já escaneados")
     else:
@@ -239,73 +285,26 @@ def cmd_snapshot(args):
         )
         snap_id = cur.lastrowid
         db.commit()
+        initial_size = 0
+        initial_hashed = 0
 
-    total_size = 0
-    hashed = 0
-    skipped = 0
-    batch = []
     batch_size = 500
     start = time.time()
-    _interrupted = False
 
-    # Handler para Ctrl+C: salva progresso e marca como interrompido
+    # Fix 6A: estado mutável em dataclass para evitar corrida em closures com nonlocal
+    state = _ScanState(
+        total_size=initial_size,
+        hashed=initial_hashed,
+    )
+
+    # Fix 1A: handler apenas sinaliza a flag; o loop é quem persiste e sai
     def _handle_sigint(signum, frame):
-        nonlocal _interrupted
-        _interrupted = True
-        print("\n\nInterrompido! Salvando progresso...")
-        if batch:
-            db.executemany(
-                "INSERT INTO files (snapshot_id, path, size, mtime, sha256) VALUES (?, ?, ?, ?, ?)",
-                batch,
-            )
-        db.execute(
-            "UPDATE snapshots SET total_files = ?, total_size = ?, status = 'interrupted' WHERE id = ?",
-            (total - skipped, total_size, snap_id),
-        )
-        db.commit()
-        logger.info(f"Snapshot #{snap_id} interrompido pelo usuário. Progresso salvo.")
-        print(f"  Snapshot #{snap_id} salvo como 'interrompido'. Use 'snapshot' novamente para retomar.")
-        sys.exit(130)
+        state.interrupted = True
 
     old_handler = signal.signal(signal.SIGINT, _handle_sigint)
 
-    # Função de progresso com rich (se disponível) ou fallback \r
-    def _run_scan_loop():
-        nonlocal total_size, hashed, skipped, batch
-
-        if _RICH_AVAILABLE:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TextColumn("•"),
-                TextColumn("{task.fields[size]}"),
-                TextColumn("•"),
-                TimeRemainingColumn(),
-            ) as progress:
-                task = progress.add_task("Escaneando", total=total, size="0 B")
-                for i, fpath in enumerate(file_list, 1):
-                    _process_file(fpath, i)
-                    progress.update(task, advance=1, size=fmt_size(total_size))
-        else:
-            for i, fpath in enumerate(file_list, 1):
-                _process_file(fpath, i)
-                if i % 100 == 0 or i == total:
-                    elapsed = time.time() - start
-                    rate = i / elapsed if elapsed > 0 else 0
-                    eta = (total - i) / rate if rate > 0 else 0
-                    print(
-                        f"\r  [{i}/{total}] {i*100//total}% | "
-                        f"{fmt_size(total_size)} | "
-                        f"{rate:.0f} arq/s | "
-                        f"ETA: {eta:.0f}s   ",
-                        end="",
-                        flush=True,
-                    )
-
     def _process_file(fpath, i):
-        nonlocal total_size, hashed, skipped, batch
+        """Processa um arquivo: stat + hash + acumula no batch."""
         try:
             relpath = os.path.relpath(fpath, mount)
             # Pula arquivos já escaneados (resume)
@@ -321,50 +320,101 @@ def cmd_snapshot(args):
             else:
                 sha = hash_file(fpath)
                 if sha:
-                    hashed += 1
+                    state.hashed += 1
 
-            total_size += size
-            batch.append((snap_id, relpath, size, mtime, sha))
+            state.total_size += size
+            state.batch.append((snap_id, relpath, size, mtime, sha))
         except (UnicodeDecodeError, OSError) as e:
             logger.debug(f"Arquivo ignorado (inacessível): {fpath} — {e}")
-            skipped += 1
+            state.skipped += 1
             return
 
-        if len(batch) >= batch_size:
+        if len(state.batch) >= batch_size:
             db.executemany(
                 "INSERT INTO files (snapshot_id, path, size, mtime, sha256) VALUES (?, ?, ?, ?, ?)",
-                batch,
+                state.batch,
             )
             db.commit()
-            batch.clear()
+            state.batch.clear()
+            # Fix 1A: verifica interrupção após cada commit para sair limpo do próximo ciclo
+            # (o loop externo também checa state.interrupted antes de chamar _process_file)
+
+    # Função de progresso com rich (se disponível) ou fallback \r
+    def _run_scan_loop():
+        """Itera sobre file_list chamando _process_file; para se state.interrupted."""
+        if _RICH_AVAILABLE:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TextColumn("•"),
+                TextColumn("{task.fields[size]}"),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task("Escaneando", total=total, size="0 B")
+                for i, fpath in enumerate(file_list, 1):
+                    if state.interrupted:
+                        break
+                    _process_file(fpath, i)
+                    progress.update(task, advance=1, size=fmt_size(state.total_size))
+        else:
+            for i, fpath in enumerate(file_list, 1):
+                if state.interrupted:
+                    break
+                _process_file(fpath, i)
+                if i % 100 == 0 or i == total:
+                    elapsed = time.time() - start
+                    rate = i / elapsed if elapsed > 0 else 0
+                    eta = (total - i) / rate if rate > 0 else 0
+                    print(
+                        f"\r  [{i}/{total}] {i*100//total}% | "
+                        f"{fmt_size(state.total_size)} | "
+                        f"{rate:.0f} arq/s | "
+                        f"ETA: {eta:.0f}s   ",
+                        end="",
+                        flush=True,
+                    )
 
     _run_scan_loop()
 
     # Restaura handler original de SIGINT
     signal.signal(signal.SIGINT, old_handler)
 
-    # Resto do batch
-    if batch:
+    # Fix 1A: flush do batch restante e status dependem de ter sido interrompido ou não
+    if state.batch:
         db.executemany(
             "INSERT INTO files (snapshot_id, path, size, mtime, sha256) VALUES (?, ?, ?, ?, ?)",
-            batch,
+            state.batch,
         )
+
+    if state.interrupted:
+        # Salva progresso parcial e sai com código 130 (convenção Ctrl+C)
+        db.execute(
+            "UPDATE snapshots SET total_files = ?, total_size = ?, status = 'interrupted' WHERE id = ?",
+            (total - state.skipped, state.total_size, snap_id),
+        )
+        db.commit()
+        logger.info(f"Snapshot #{snap_id} interrompido pelo usuário. Progresso salvo.")
+        print(f"\n\nInterrompido! Snapshot #{snap_id} salvo como 'interrompido'. Use 'snapshot' novamente para retomar.")
+        sys.exit(130)
 
     db.execute(
         "UPDATE snapshots SET total_files = ?, total_size = ?, status = 'complete' WHERE id = ?",
-        (total - skipped, total_size, snap_id),
+        (total - state.skipped, state.total_size, snap_id),
     )
     db.commit()
 
     elapsed = time.time() - start
     print(f"\n\nSnapshot #{snap_id} criado!")
-    print(f"  Arquivos: {total - skipped} ({skipped} inacessíveis)")
-    print(f"  Tamanho total: {fmt_size(total_size)}")
-    print(f"  Hasheados: {hashed}")
+    print(f"  Arquivos: {total - state.skipped} ({state.skipped} inacessíveis)")
+    print(f"  Tamanho total: {fmt_size(state.total_size)}")
+    print(f"  Hasheados: {state.hashed}")
     print(f"  Tempo: {elapsed:.1f}s")
     logger.info(
-        f"Snapshot #{snap_id} concluído: {total - skipped} arquivos, "
-        f"{fmt_size(total_size)}, {skipped} inacessíveis, {elapsed:.1f}s"
+        f"Snapshot #{snap_id} concluído: {total - state.skipped} arquivos, "
+        f"{fmt_size(state.total_size)}, {state.skipped} inacessíveis, {elapsed:.1f}s"
     )
 
 
@@ -393,8 +443,18 @@ def cmd_list(args):
         else:
             color = _COLORS["red"]        # muito antigo
         reset = _COLORS["reset"] if color else ""
+
+        # Indicador de status: apenas exibido quando diferente de 'complete'
+        status = r['status'] if r['status'] else 'complete'
+        if status == 'scanning':
+            status_tag = f" {_COLORS['yellow']}[SCANNING]{reset}{color}"
+        elif status == 'interrupted':
+            status_tag = f" {_COLORS['red']}[INTERRUPTED]{reset}{color}"
+        else:
+            status_tag = ""  # completo — sem indicador extra
+
         print(
-            f"{color}{r['id']:>4}  {r['label']:<20}  {r['total_files']:>10}  "
+            f"{color}{r['id']:>4}  {r['label']:<20}{status_tag}  {r['total_files']:>10}  "
             f"{fmt_size(r['total_size']):>10}  {r['created_at'][:19]:>20}  {r['mount_path']}{reset}"
         )
 
@@ -473,42 +533,44 @@ def cmd_search(args):
 def cmd_duplicates(args):
     db = get_db()
 
-    if args.across:
-        # Duplicatas ENTRE snapshots diferentes
-        query = """
-            SELECT sha256, size, COUNT(*) as cnt, COUNT(DISTINCT snapshot_id) as snap_cnt
-            FROM files
-            WHERE sha256 IS NOT NULL
-            GROUP BY sha256
-            HAVING COUNT(DISTINCT snapshot_id) > 1
-            ORDER BY size DESC
-        """
-        desc = "entre drives diferentes"
-    else:
-        # Todas as duplicatas (mesmo drive ou entre drives)
-        query = """
-            SELECT sha256, size, COUNT(*) as cnt, COUNT(DISTINCT snapshot_id) as snap_cnt
-            FROM files
-            WHERE sha256 IS NOT NULL
-            GROUP BY sha256
-            HAVING COUNT(*) > 1
-            ORDER BY size DESC
-        """
-        desc = "em todos os snapshots"
+    # Fix 8A: cláusula HAVING dinâmica elimina duplicação das duas queries
+    having = "HAVING COUNT(DISTINCT snapshot_id) > 1" if args.across else "HAVING COUNT(*) > 1"
+    desc = "entre drives diferentes" if args.across else "em todos os snapshots"
+
+    base_query = f"""
+        SELECT sha256, size, COUNT(*) as cnt, COUNT(DISTINCT snapshot_id) as snap_cnt
+        FROM files
+        WHERE sha256 IS NOT NULL
+        GROUP BY sha256
+        {having}
+        ORDER BY size DESC
+    """
 
     limit = args.limit or 50
-    rows = db.execute(query).fetchall()
 
-    if not rows:
+    # Fix 10A: calcula totais via subquery — evita carregar todas as linhas em memória
+    totals_query = f"""
+        SELECT COUNT(*) as groups,
+               SUM(size * (cnt - 1)) as wasted,
+               SUM(cnt - 1) as copies
+        FROM ({base_query})
+    """
+    totals = db.execute(totals_query).fetchone()
+
+    if not totals["groups"]:
         print(f"Nenhuma duplicata encontrada {desc}.")
         return
 
-    total_wasted = sum(r["size"] * (r["cnt"] - 1) for r in rows)
-    total_copies = sum(r["cnt"] - 1 for r in rows)
-    print(f"Duplicatas {desc}: {len(rows)} grupos, {total_copies} cópias extras ({fmt_size(total_wasted)} desperdiçado)\n")
+    print(
+        f"Duplicatas {desc}: {totals['groups']} grupos, "
+        f"{totals['copies']} cópias extras ({fmt_size(totals['wasted'])} desperdiçado)\n"
+    )
+
+    # Busca somente as linhas necessárias para exibição (LIMIT aplicado no SQL)
+    display_query = f"{base_query} LIMIT ?"
+    display_rows = db.execute(display_query, (limit,)).fetchall()
 
     # Busca todas as localizações de uma vez (evita N+1 queries)
-    display_rows = rows[:limit]
     all_hashes = [r["sha256"] for r in display_rows]
     locs_by_hash = defaultdict(list)
     if all_hashes:
@@ -530,8 +592,8 @@ def cmd_duplicates(args):
         print()
         shown += 1
 
-    if len(rows) > limit:
-        print(f"  ... e mais {len(rows) - limit} grupos. Use --limit para ver mais.")
+    if totals["groups"] > limit:
+        print(f"  ... e mais {totals['groups'] - limit} grupos. Use --limit para ver mais.")
 
 
 def cmd_compare(args):
@@ -1197,6 +1259,9 @@ def main():
 
     # Inicializa logging antes de despachar qualquer comando
     _setup_logging(args.verbose)
+
+    # Executa migrações de schema uma única vez por invocação
+    _migrate_db(get_db())
 
     {
         "snapshot": cmd_snapshot,
