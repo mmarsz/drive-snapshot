@@ -20,14 +20,67 @@ Uso:
 import argparse
 import hashlib
 import json
+import logging
 import os
+import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import time
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
+# Dependência opcional: rich para barras de progresso coloridas
+try:
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeRemainingColumn,
+    )
+    _RICH_AVAILABLE = True
+except ImportError:
+    _RICH_AVAILABLE = False
+
+# Cores ANSI para output colorido
+_COLORS = {
+    "red": "\033[31m",
+    "yellow": "\033[33m",
+    "green": "\033[32m",
+    "dim": "\033[2m",
+    "reset": "\033[0m",
+}
+# Desabilita cores se stdout não é terminal
+if not sys.stdout.isatty():
+    _COLORS = {k: "" for k in _COLORS}
+
 DB_PATH = Path(__file__).parent / "snapshots.db"
+
+
+# --- Logging ---
+
+def _setup_logging(verbose=False):
+    """Configura logging para arquivo e opcionalmente terminal."""
+    log_dir = Path.home() / ".local" / "share" / "drive-snapshot"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "drive-snapshot.log"
+
+    handlers = [logging.FileHandler(log_file, encoding="utf-8")]
+    if verbose:
+        handlers.append(logging.StreamHandler())
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+    )
+    return logging.getLogger("drive-snapshot")
+
 
 # --- Database ---
 
@@ -42,9 +95,14 @@ def get_db():
             mount_path TEXT NOT NULL,
             created_at TEXT NOT NULL,
             total_files INTEGER DEFAULT 0,
-            total_size INTEGER DEFAULT 0
+            total_size INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'complete'
         )
     """)
+    # Migração: adiciona coluna status em bancos antigos que não a possuem
+    cols = {row[1] for row in db.execute("PRAGMA table_info(snapshots)").fetchall()}
+    if "status" not in cols:
+        db.execute("ALTER TABLE snapshots ADD COLUMN status TEXT DEFAULT 'complete'")
     db.execute("""
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,18 +168,35 @@ def fmt_time(ts):
 # --- Commands ---
 
 def cmd_snapshot(args):
+    logger = logging.getLogger("drive-snapshot")
     mount = os.path.abspath(args.path)
     if not os.path.isdir(mount):
         print(f"Erro: '{mount}' não é um diretório válido.", file=sys.stderr)
         sys.exit(1)
 
-    label = args.label or os.path.basename(mount) or mount
+    # Auto-detecta label do filesystem via lsblk se --label não fornecido
+    label = args.label
+    if not label:
+        try:
+            result = subprocess.run(
+                ['lsblk', '-no', 'LABEL', mount],
+                capture_output=True, text=True, timeout=5,
+            )
+            detected = result.stdout.strip()
+            if detected:
+                label = detected
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # lsblk não disponível, usa fallback
+    if not label:
+        label = os.path.basename(mount) or mount
     print(f"Escaneando: {mount}")
     print(f"Label: {label}")
+    logger.info(f"Iniciando snapshot: path={mount} label={label}")
 
     # Callback para erros de acesso durante os.walk (ex.: nomes não-UTF-8 em NTFS/exFAT)
     def walk_error(err):
         print(f"\n  AVISO: não foi possível acessar: {err.filename} ({err})", file=sys.stderr)
+        logger.warning(f"Erro de acesso durante walk: {err.filename} ({err})")
 
     # Primeira passada: contar arquivos para barra de progresso
     print("Contando arquivos...", end="", flush=True)
@@ -136,14 +211,34 @@ def cmd_snapshot(args):
 
     if total == 0:
         print("Nenhum arquivo encontrado. Nada a fazer.")
+        logger.info("Nenhum arquivo encontrado. Snapshot cancelado.")
         return
 
     db = get_db()
-    cur = db.execute(
-        "INSERT INTO snapshots (label, mount_path, created_at) VALUES (?, ?, ?)",
-        (label, mount, datetime.now().isoformat()),
-    )
-    snap_id = cur.lastrowid
+
+    # Verifica se há snapshot interrompido com mesmo label+mount para retomar
+    already_scanned = set()
+    existing = db.execute(
+        "SELECT id FROM snapshots WHERE label = ? AND mount_path = ? AND status IN ('scanning', 'interrupted')",
+        (label, mount),
+    ).fetchone()
+    if existing:
+        snap_id = existing["id"]
+        # Carrega paths já escaneados para pular
+        already_scanned = {
+            r["path"] for r in db.execute(
+                "SELECT path FROM files WHERE snapshot_id = ?", (snap_id,)
+            ).fetchall()
+        }
+        print(f"  Retomando snapshot #{snap_id} ({len(already_scanned)} arquivos já escaneados)")
+        logger.info(f"Retomando snapshot #{snap_id} com {len(already_scanned)} arquivos já escaneados")
+    else:
+        cur = db.execute(
+            "INSERT INTO snapshots (label, mount_path, created_at, status) VALUES (?, ?, ?, 'scanning')",
+            (label, mount, datetime.now().isoformat()),
+        )
+        snap_id = cur.lastrowid
+        db.commit()
 
     total_size = 0
     hashed = 0
@@ -151,17 +246,76 @@ def cmd_snapshot(args):
     batch = []
     batch_size = 500
     start = time.time()
+    _interrupted = False
 
-    for i, fpath in enumerate(file_list, 1):
+    # Handler para Ctrl+C: salva progresso e marca como interrompido
+    def _handle_sigint(signum, frame):
+        nonlocal _interrupted
+        _interrupted = True
+        print("\n\nInterrompido! Salvando progresso...")
+        if batch:
+            db.executemany(
+                "INSERT INTO files (snapshot_id, path, size, mtime, sha256) VALUES (?, ?, ?, ?, ?)",
+                batch,
+            )
+        db.execute(
+            "UPDATE snapshots SET total_files = ?, total_size = ?, status = 'interrupted' WHERE id = ?",
+            (total - skipped, total_size, snap_id),
+        )
+        db.commit()
+        logger.info(f"Snapshot #{snap_id} interrompido pelo usuário. Progresso salvo.")
+        print(f"  Snapshot #{snap_id} salvo como 'interrompido'. Use 'snapshot' novamente para retomar.")
+        sys.exit(130)
+
+    old_handler = signal.signal(signal.SIGINT, _handle_sigint)
+
+    # Função de progresso com rich (se disponível) ou fallback \r
+    def _run_scan_loop():
+        nonlocal total_size, hashed, skipped, batch
+
+        if _RICH_AVAILABLE:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TextColumn("•"),
+                TextColumn("{task.fields[size]}"),
+                TextColumn("•"),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task("Escaneando", total=total, size="0 B")
+                for i, fpath in enumerate(file_list, 1):
+                    _process_file(fpath, i)
+                    progress.update(task, advance=1, size=fmt_size(total_size))
+        else:
+            for i, fpath in enumerate(file_list, 1):
+                _process_file(fpath, i)
+                if i % 100 == 0 or i == total:
+                    elapsed = time.time() - start
+                    rate = i / elapsed if elapsed > 0 else 0
+                    eta = (total - i) / rate if rate > 0 else 0
+                    print(
+                        f"\r  [{i}/{total}] {i*100//total}% | "
+                        f"{fmt_size(total_size)} | "
+                        f"{rate:.0f} arq/s | "
+                        f"ETA: {eta:.0f}s   ",
+                        end="",
+                        flush=True,
+                    )
+
+    def _process_file(fpath, i):
+        nonlocal total_size, hashed, skipped, batch
         try:
-            stat = os.stat(fpath)
-            size = stat.st_size
-            mtime = stat.st_mtime
-
-            # Path relativo ao mount point
             relpath = os.path.relpath(fpath, mount)
+            # Pula arquivos já escaneados (resume)
+            if relpath in already_scanned:
+                return
 
-            # Hash (pula arquivos enormes >4GB com flag, mas faz por padrão)
+            stat_info = os.stat(fpath)
+            size = stat_info.st_size
+            mtime = stat_info.st_mtime
+
             if args.no_hash:
                 sha = None
             else:
@@ -171,10 +325,10 @@ def cmd_snapshot(args):
 
             total_size += size
             batch.append((snap_id, relpath, size, mtime, sha))
-        except (UnicodeDecodeError, OSError):
-            # Ignora arquivos com nomes/conteúdo não-decodificável ou inacessíveis
+        except (UnicodeDecodeError, OSError) as e:
+            logger.debug(f"Arquivo ignorado (inacessível): {fpath} — {e}")
             skipped += 1
-            continue
+            return
 
         if len(batch) >= batch_size:
             db.executemany(
@@ -184,19 +338,10 @@ def cmd_snapshot(args):
             db.commit()
             batch.clear()
 
-        # Progresso
-        if i % 100 == 0 or i == total:
-            elapsed = time.time() - start
-            rate = i / elapsed if elapsed > 0 else 0
-            eta = (total - i) / rate if rate > 0 else 0
-            print(
-                f"\r  [{i}/{total}] {i*100//total}% | "
-                f"{fmt_size(total_size)} | "
-                f"{rate:.0f} arq/s | "
-                f"ETA: {eta:.0f}s   ",
-                end="",
-                flush=True,
-            )
+    _run_scan_loop()
+
+    # Restaura handler original de SIGINT
+    signal.signal(signal.SIGINT, old_handler)
 
     # Resto do batch
     if batch:
@@ -206,7 +351,7 @@ def cmd_snapshot(args):
         )
 
     db.execute(
-        "UPDATE snapshots SET total_files = ?, total_size = ? WHERE id = ?",
+        "UPDATE snapshots SET total_files = ?, total_size = ?, status = 'complete' WHERE id = ?",
         (total - skipped, total_size, snap_id),
     )
     db.commit()
@@ -217,6 +362,10 @@ def cmd_snapshot(args):
     print(f"  Tamanho total: {fmt_size(total_size)}")
     print(f"  Hasheados: {hashed}")
     print(f"  Tempo: {elapsed:.1f}s")
+    logger.info(
+        f"Snapshot #{snap_id} concluído: {total - skipped} arquivos, "
+        f"{fmt_size(total_size)}, {skipped} inacessíveis, {elapsed:.1f}s"
+    )
 
 
 def cmd_list(args):
@@ -232,9 +381,21 @@ def cmd_list(args):
     print(f"{'ID':>4}  {'Label':<20}  {'Arquivos':>10}  {'Tamanho':>10}  {'Data':>20}  Mount")
     print("-" * 95)
     for r in rows:
+        # Determina cor pela idade do snapshot
+        created = datetime.fromisoformat(r['created_at'][:19])
+        age = datetime.now() - created
+        if age < timedelta(days=7):
+            color = _COLORS["green"]      # recente
+        elif age < timedelta(days=30):
+            color = ""                    # normal (sem cor)
+        elif age < timedelta(days=90):
+            color = _COLORS["yellow"]     # antigo
+        else:
+            color = _COLORS["red"]        # muito antigo
+        reset = _COLORS["reset"] if color else ""
         print(
-            f"{r['id']:>4}  {r['label']:<20}  {r['total_files']:>10}  "
-            f"{fmt_size(r['total_size']):>10}  {r['created_at'][:19]:>20}  {r['mount_path']}"
+            f"{color}{r['id']:>4}  {r['label']:<20}  {r['total_files']:>10}  "
+            f"{fmt_size(r['total_size']):>10}  {r['created_at'][:19]:>20}  {r['mount_path']}{reset}"
         )
 
 
@@ -264,23 +425,46 @@ def cmd_files(args):
 
 def cmd_search(args):
     db = get_db()
-    pattern = f"%{args.pattern}%"
-    rows = db.execute(
-        """
-        SELECT f.path, f.size, f.sha256, s.id as snap_id, s.label
-        FROM files f JOIN snapshots s ON f.snapshot_id = s.id
-        WHERE f.path LIKE ?
-        ORDER BY f.path
-        LIMIT 200
-        """,
-        (pattern,),
-    ).fetchall()
+
+    if getattr(args, 'regex', False):
+        # Busca com regex via função personalizada no SQLite
+        try:
+            regex = re.compile(args.pattern, re.IGNORECASE)
+        except re.error as e:
+            print(f"Regex inválida: {e}", file=sys.stderr)
+            sys.exit(1)
+        db.create_function("regexp", 2, lambda pattern, string: bool(regex.search(string)) if string else False)
+        rows = db.execute(
+            """
+            SELECT f.path, f.size, f.sha256, s.id as snap_id, s.label
+            FROM files f JOIN snapshots s ON f.snapshot_id = s.id
+            WHERE regexp(?, f.path)
+            ORDER BY f.path
+            LIMIT 200
+            """,
+            (args.pattern,),
+        ).fetchall()
+        mode = "regex"
+    else:
+        # Busca padrão com LIKE
+        pattern = f"%{args.pattern}%"
+        rows = db.execute(
+            """
+            SELECT f.path, f.size, f.sha256, s.id as snap_id, s.label
+            FROM files f JOIN snapshots s ON f.snapshot_id = s.id
+            WHERE f.path LIKE ?
+            ORDER BY f.path
+            LIMIT 200
+            """,
+            (pattern,),
+        ).fetchall()
+        mode = "LIKE"
 
     if not rows:
         print(f"Nenhum arquivo encontrado com '{args.pattern}'.")
         return
 
-    print(f"Resultados para '{args.pattern}' ({len(rows)} encontrados):\n")
+    print(f"Resultados ({mode}) para '{args.pattern}' ({len(rows)} encontrados):\n")
     for r in rows:
         sha_short = r["sha256"][:12] + "…" if r["sha256"] else ""
         print(f"  [{r['label']}#{r['snap_id']}]  {fmt_size(r['size']):>10}  {sha_short}  {r['path']}")
@@ -320,22 +504,28 @@ def cmd_duplicates(args):
         return
 
     total_wasted = sum(r["size"] * (r["cnt"] - 1) for r in rows)
-    print(f"Duplicatas {desc}: {len(rows)} grupos ({fmt_size(total_wasted)} desperdiçado em cópias extras)\n")
+    total_copies = sum(r["cnt"] - 1 for r in rows)
+    print(f"Duplicatas {desc}: {len(rows)} grupos, {total_copies} cópias extras ({fmt_size(total_wasted)} desperdiçado)\n")
+
+    # Busca todas as localizações de uma vez (evita N+1 queries)
+    display_rows = rows[:limit]
+    all_hashes = [r["sha256"] for r in display_rows]
+    locs_by_hash = defaultdict(list)
+    if all_hashes:
+        placeholders = ",".join("?" * len(all_hashes))
+        locations = db.execute(f"""
+            SELECT f.sha256, f.path, s.label, s.id as snap_id
+            FROM files f JOIN snapshots s ON f.snapshot_id = s.id
+            WHERE f.sha256 IN ({placeholders})
+            ORDER BY f.sha256, s.label, f.path
+        """, all_hashes).fetchall()
+        for loc in locations:
+            locs_by_hash[loc["sha256"]].append(loc)
 
     shown = 0
-    for r in rows[:limit]:
+    for r in display_rows:
         print(f"  Hash: {r['sha256'][:16]}…  Tamanho: {fmt_size(r['size'])}  Cópias: {r['cnt']} (em {r['snap_cnt']} snapshot(s))")
-
-        # Mostra onde estão
-        locs = db.execute(
-            """
-            SELECT f.path, s.label, s.id as snap_id
-            FROM files f JOIN snapshots s ON f.snapshot_id = s.id
-            WHERE f.sha256 = ?
-            """,
-            (r["sha256"],),
-        ).fetchall()
-        for loc in locs:
+        for loc in locs_by_hash[r["sha256"]]:
             print(f"    [{loc['label']}#{loc['snap_id']}] {loc['path']}")
         print()
         shown += 1
@@ -434,6 +624,7 @@ def cmd_export(args):
 
 
 def cmd_mount(args):
+    logger = logging.getLogger("drive-snapshot")
     try:
         from fuse import FUSE, FuseOSError, Operations
     except ImportError:
@@ -700,8 +891,12 @@ def cmd_mount(args):
     print()
     print(f"  Para desmontar: fusermount -u {mountpoint}")
     print()
+    logger.info(f"Montando snapshot #{snap['id']} '{snap['label']}' em {mountpoint}")
 
     FUSE(SnapshotFS(args.snapshot_id), mountpoint, foreground=True, allow_other=False, nothreads=False)
+
+    # Chegamos aqui após desmontagem (FUSE bloqueante)
+    logger.info(f"Snapshot #{snap['id']} desmontado de {mountpoint}")
 
 
 def cmd_pending(args):
@@ -763,6 +958,7 @@ def _validate_path(mount_real, relpath):
 
 
 def cmd_apply(args):
+    logger = logging.getLogger("drive-snapshot")
     db = get_db()
     snap = db.execute("SELECT * FROM snapshots WHERE id = ?", (args.snapshot_id,)).fetchone()
     if not snap:
@@ -773,6 +969,8 @@ def cmd_apply(args):
     if not os.path.isdir(mount_real):
         print(f"Erro: '{mount_real}' não é um diretório válido.", file=sys.stderr)
         sys.exit(1)
+
+    snap_id = args.snapshot_id
 
     # Ordena por prioridade de tipo (mkdir antes de move, delete antes de rmdir)
     # para garantir que diretórios sejam criados antes de mover arquivos para dentro deles
@@ -824,65 +1022,78 @@ def cmd_apply(args):
     erros = 0
     conflitos = 0  # destino já existe antes do move
     for r in rows:
+        op_type = r["op_type"]
+        src_path = r["src_path"]
+        dst_path = r["dst_path"]
         try:
-            if r["op_type"] == "mkdir":
+            if op_type == "mkdir":
                 # Valida src_path antes de criar diretório
                 try:
-                    target = _validate_path(mount_real, r["src_path"])
+                    target = _validate_path(mount_real, src_path)
                 except ValueError:
-                    print(f"ERRO: path inválido (escapa mount): {r['src_path']}")
+                    print(f"ERRO: path inválido (escapa mount): {src_path}")
+                    logger.warning(f"APPLY #{snap_id}: mkdir {src_path} FAILED: path escapa do mount")
                     erros += 1
                     continue
                 os.makedirs(target, exist_ok=True)
-                print(f"  OK mkdir: {r['src_path']}")
-            elif r["op_type"] == "move":
+                print(f"  OK mkdir: {src_path}")
+                logger.info(f"APPLY #{snap_id}: mkdir {src_path} -> {target} OK")
+            elif op_type == "move":
                 # Valida src_path e dst_path antes de mover
                 try:
-                    src = _validate_path(mount_real, r["src_path"])
-                    dst = _validate_path(mount_real, r["dst_path"])
+                    src = _validate_path(mount_real, src_path)
+                    dst = _validate_path(mount_real, dst_path)
                 except ValueError:
                     # Reporta qual dos dois caminhos disparou a violação
-                    print(f"ERRO: path inválido (escapa mount): {r['src_path']} → {r['dst_path']}")
+                    print(f"ERRO: path inválido (escapa mount): {src_path} → {dst_path}")
+                    logger.warning(f"APPLY #{snap_id}: move {src_path} -> {dst_path} FAILED: path escapa do mount")
                     erros += 1
                     continue
                 # Proteção contra sobrescrita silenciosa: se o destino já existe,
                 # aborta a operação e registra como conflito
                 if os.path.exists(dst):
-                    print(f"  CONFLITO: destino já existe: {r['dst_path']} (pulando)")
+                    print(f"  CONFLITO: destino já existe: {dst_path} (pulando)")
+                    logger.warning(f"APPLY #{snap_id}: move {src_path} -> {dst_path} CONFLITO: destino já existe")
                     conflitos += 1
                     continue
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.move(src, dst)
-                print(f"  OK move: {r['src_path']} → {r['dst_path']}")
-            elif r["op_type"] == "delete":
+                print(f"  OK move: {src_path} → {dst_path}")
+                logger.info(f"APPLY #{snap_id}: move {src_path} -> {dst_path} OK")
+            elif op_type == "delete":
                 # Valida src_path antes de deletar arquivo
                 try:
-                    target = _validate_path(mount_real, r["src_path"])
+                    target = _validate_path(mount_real, src_path)
                 except ValueError:
-                    print(f"ERRO: path inválido (escapa mount): {r['src_path']}")
+                    print(f"ERRO: path inválido (escapa mount): {src_path}")
+                    logger.warning(f"APPLY #{snap_id}: delete {src_path} FAILED: path escapa do mount")
                     erros += 1
                     continue
                 if os.path.isfile(target):
                     os.remove(target)
-                    print(f"  OK delete: {r['src_path']}")
+                    print(f"  OK delete: {src_path}")
+                    logger.info(f"APPLY #{snap_id}: delete {src_path} -> {target} OK")
                 else:
-                    print(f"  SKIP (não encontrado): {r['src_path']}")
-            elif r["op_type"] == "rmdir":
+                    print(f"  SKIP (não encontrado): {src_path}")
+            elif op_type == "rmdir":
                 # Valida src_path antes de remover diretório
                 try:
-                    target = _validate_path(mount_real, r["src_path"])
+                    target = _validate_path(mount_real, src_path)
                 except ValueError:
-                    print(f"ERRO: path inválido (escapa mount): {r['src_path']}")
+                    print(f"ERRO: path inválido (escapa mount): {src_path}")
+                    logger.warning(f"APPLY #{snap_id}: rmdir {src_path} FAILED: path escapa do mount")
                     erros += 1
                     continue
                 if os.path.isdir(target):
                     os.rmdir(target)
-                    print(f"  OK rmdir: {r['src_path']}")
+                    print(f"  OK rmdir: {src_path}")
+                    logger.info(f"APPLY #{snap_id}: rmdir {src_path} -> {target} OK")
                 else:
-                    print(f"  SKIP (não encontrado): {r['src_path']}")
+                    print(f"  SKIP (não encontrado): {src_path}")
             ok += 1
         except Exception as e:
-            print(f"  ERRO: {r['op_type']} {r['src_path']}: {e}")
+            print(f"  ERRO: {op_type} {src_path}: {e}")
+            logger.warning(f"APPLY #{snap_id}: {op_type} {src_path} FAILED: {e}")
             erros += 1
 
     # Limpa operações aplicadas
@@ -890,9 +1101,11 @@ def cmd_apply(args):
     db.commit()
 
     print(f"\nConcluído: {ok} ok, {erros} erros, {conflitos} conflitos.")
+    logger.info(f"APPLY #{snap_id}: concluído - {ok} ok, {erros} erros, {conflitos} conflitos")
 
 
 def cmd_delete(args):
+    logger = logging.getLogger("drive-snapshot")
     db = get_db()
     snap = db.execute("SELECT * FROM snapshots WHERE id = ?", (args.snapshot_id,)).fetchone()
     if not snap:
@@ -908,6 +1121,7 @@ def cmd_delete(args):
     db.execute("DELETE FROM snapshots WHERE id = ?", (args.snapshot_id,))
     db.commit()
     print(f"Snapshot #{args.snapshot_id} removido.")
+    logger.info(f"Snapshot #{args.snapshot_id} '{snap['label']}' removido ({snap['total_files']} arquivos)")
 
 
 # --- CLI ---
@@ -918,6 +1132,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    # Flag global de verbose — funciona com todos os subcomandos
+    parser.add_argument("--verbose", "-v", action="store_true", help="Mostra logs detalhados no terminal")
     sub = parser.add_subparsers(dest="command")
 
     # snapshot
@@ -938,6 +1154,7 @@ def main():
     # search
     p = sub.add_parser("search", help="Busca arquivos por nome")
     p.add_argument("pattern", help="Texto para buscar no caminho")
+    p.add_argument("--regex", action="store_true", help="Usa regex em vez de LIKE (ex: '.*\\.raw$')")
 
     # duplicates
     p = sub.add_parser("duplicates", help="Encontra duplicatas por hash")
@@ -977,6 +1194,9 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
+    # Inicializa logging antes de despachar qualquer comando
+    _setup_logging(args.verbose)
 
     {
         "snapshot": cmd_snapshot,
