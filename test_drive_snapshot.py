@@ -618,3 +618,31 @@ def test_export_includes_quick_hash(tmp_path, tmp_db, monkeypatch):
     content = csv_files[0].read_text()
     assert "quick_hash" in content.splitlines()[0], "cabeçalho deve ter quick_hash"
     assert "100:deadbeefdeadbeef" in content, "valor de quick_hash deve estar no CSV"
+
+
+# ---------------------------------------------------------------------------
+# 20: snapshot --exclude poda dirs e arquivos
+# ---------------------------------------------------------------------------
+
+def test_snapshot_exclude(tmp_path, tmp_db):
+    """--exclude deve podar dirs casados e ignorar arquivos por glob."""
+    drive = tmp_path / "drive"
+    (drive / "src").mkdir(parents=True)
+    (drive / "src" / "main.py").write_text("print(1)")
+    (drive / "src" / "main.pyc").write_bytes(b"\x00")
+    (drive / "node_modules" / "lib").mkdir(parents=True)
+    (drive / "node_modules" / "lib" / "index.js").write_text("x")
+    (drive / "keep.txt").write_text("keep")
+
+    args = types.SimpleNamespace(
+        path=str(drive), label="excl", no_hash=True, quick=False, jobs=1,
+        exclude=["node_modules", "*.pyc"],
+    )
+    ds.cmd_snapshot(args)
+
+    db = ds.get_db()
+    paths = {r["path"] for r in db.execute("SELECT path FROM files").fetchall()}
+    assert "keep.txt" in paths
+    assert "src/main.py" in paths
+    assert "src/main.pyc" not in paths, "*.pyc deve ser excluído"
+    assert not any(p.startswith("node_modules") for p in paths), "node_modules deve ser podado"

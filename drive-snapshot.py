@@ -5,7 +5,7 @@ Cria snapshots com hashes para encontrar duplicatas entre drives.
 
 Uso:
   ./drive-snapshot.py snapshot <caminho> [--label NOME]   Escaneia um drive montado
-                       [--quick] [--jobs N]                (--quick=fingerprint rápida, --jobs=threads)
+                       [--quick] [--jobs N] [--exclude P]  (--quick=fingerprint, --jobs=threads, --exclude=glob)
   ./drive-snapshot.py update <snapshot_id> [caminho]       Snapshot incremental (reusa hashes)
   ./drive-snapshot.py list                                 Lista todos os snapshots
   ./drive-snapshot.py files <snapshot_id> [--sort size]    Lista arquivos de um snapshot
@@ -20,6 +20,7 @@ Uso:
 """
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import logging
@@ -92,6 +93,9 @@ def get_db():
     db = sqlite3.connect(str(DB_PATH))
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    # Espera até 30s por um lock em vez de falhar na hora — permite dois scans
+    # (ex.: dois snapshots em paralelo) escrevendo no mesmo banco sem "database is locked".
+    db.execute("PRAGMA busy_timeout=30000")
     db.execute("""
         CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -289,6 +293,14 @@ def _scan_into_snapshot(args, mount, label, prior=None, new_snapshot=False):
     quick = getattr(args, "quick", False)
     no_hash = getattr(args, "no_hash", False)
     jobs = _detect_jobs(mount, getattr(args, "jobs", 0))
+    exclude = getattr(args, "exclude", None) or []
+
+    def _excluded(name, rel):
+        """True se o nome (basename) ou o caminho relativo casar com algum padrão."""
+        return any(
+            fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel, pat)
+            for pat in exclude
+        )
 
     def walk_error(err):
         print(f"\n  AVISO: não foi possível acessar: {err.filename} ({err})", file=sys.stderr)
@@ -297,7 +309,18 @@ def _scan_into_snapshot(args, mount, label, prior=None, new_snapshot=False):
     print("Contando arquivos...", end="", flush=True)
     file_list = []
     for root, dirs, filenames in os.walk(mount, onerror=walk_error):
+        rel_root = os.path.relpath(root, mount)
+        rel_root = "" if rel_root == "." else rel_root
+        # Poda diretórios excluídos in-place: os.walk não desce neles (mais rápido)
+        if exclude:
+            dirs[:] = [
+                d for d in dirs
+                if not _excluded(d, os.path.join(rel_root, d) if rel_root else d)
+            ]
         for fname in filenames:
+            rel = os.path.join(rel_root, fname) if rel_root else fname
+            if exclude and _excluded(fname, rel):
+                continue
             fpath = os.path.join(root, fname)
             if os.path.isfile(fpath) and not os.path.islink(fpath):
                 file_list.append(fpath)
@@ -1383,6 +1406,8 @@ def main():
                    help="Fingerprint barata (size + bordas de 64KB) em vez de SHA256 completo — muito mais rápido, duplicatas aproximadas")
     p.add_argument("--jobs", "-j", type=int, default=0,
                    help="Threads de hashing (0=auto: 1 em HD mecânico, N em SSD/NVMe)")
+    p.add_argument("--exclude", action="append", metavar="PADRÃO",
+                   help="Ignora arquivos/dirs que casem com o padrão glob (repetível). Ex: --exclude node_modules --exclude '.cache' --exclude '*.pyc'")
 
     # update
     p = sub.add_parser("update", help="Snapshot incremental (reaproveita hashes inalterados)")
@@ -1392,6 +1417,8 @@ def main():
     p.add_argument("--no-hash", action="store_true", help="Pula o cálculo de SHA256")
     p.add_argument("--quick", action="store_true", help="Fingerprint barata em vez de SHA256 completo")
     p.add_argument("--jobs", "-j", type=int, default=0, help="Threads de hashing (0=auto)")
+    p.add_argument("--exclude", action="append", metavar="PADRÃO",
+                   help="Ignora arquivos/dirs que casem com o padrão glob (repetível)")
 
     # list
     sub.add_parser("list", help="Lista snapshots")
