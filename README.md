@@ -54,6 +54,31 @@ Requires Python 3.8+ and `libfuse` (pre-installed on most Linux distros).
 ./drive-snapshot.py snapshot /mnt/hd-photos --no-hash
 ```
 
+#### Speeding up large drives
+
+```bash
+# Quick fingerprint instead of full SHA256: hashes only size + first/last 64KB.
+# Much faster on big files; duplicate detection is approximate (rare false positives).
+./drive-snapshot.py snapshot /mnt/hd-photos --quick
+
+# Parallel hashing. Default (--jobs 0) auto-detects: 1 thread on a mechanical HD
+# (parallel reads cause seek thrashing), N threads on SSD/NVMe.
+./drive-snapshot.py snapshot /mnt/ssd-backup --jobs 8
+```
+
+#### Incremental update
+
+Re-scan a drive reusing hashes from a previous snapshot — only changed files
+(by size+mtime) are re-hashed. Creates a new snapshot, preserving history.
+
+```bash
+# Reuse hashes from snapshot #1, scanning its original mount path
+./drive-snapshot.py update 1
+
+# Or point at a different path / give a new label
+./drive-snapshot.py update 1 /mnt/hd-photos --label "HD-Photos-2026"
+```
+
 **Resumable scans:** If you interrupt a scan with Ctrl+C, progress is saved. Run the same `snapshot` command again to resume from where you left off.
 
 ### List snapshots
@@ -204,7 +229,8 @@ All other features work with just Python stdlib.
 ## Limitations
 
 - **File content is not stored** — only metadata (path, size, modification time, SHA256). The virtual mount shows the directory structure but files contain placeholder data.
-- **Hashing large drives takes time** — use `--no-hash` for a quick catalog, or let it run. Progress is shown with ETA.
+- **Hashing large drives takes time** — use `--quick` (fingerprint), `--jobs N` (parallel on SSD), `update` (incremental), or `--no-hash` for a quick catalog. Progress is shown with ETA.
+- **`--quick` is approximate** — fingerprints size + 128KB of edges, so two different files with identical size and edges (rare) could be flagged as duplicates. Use full SHA256 (default) when you need certainty.
 - **FUSE mount requires `fusepy`** — all other features work with just Python stdlib.
 
 ## Roadmap

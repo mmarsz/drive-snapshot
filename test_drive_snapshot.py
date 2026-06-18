@@ -191,6 +191,46 @@ def test_apply_conflict_detection(tmp_path, tmp_db, populated_db, capsys):
     assert "CONFLITO" in captured.out
     # Arquivo de destino não deve ter sido sobrescrito
     assert dst_file.read_text() == "ja existe"
+    # Op que deu conflito deve PERMANECER pendente (não pode ser perdida)
+    restantes = db.execute(
+        "SELECT COUNT(*) AS c FROM pending_ops WHERE snapshot_id = ?", (snap_id,)
+    ).fetchone()["c"]
+    assert restantes == 1, "operação em conflito deve continuar pendente para retry"
+
+
+def test_apply_success_removes_only_applied(tmp_path, tmp_db, populated_db):
+    """Op bem-sucedida é removida; op que falha (conflito) continua pendente."""
+    snap_id, db = populated_db
+
+    drive = tmp_path / "drive"
+    (drive / "docs").mkdir(parents=True)
+    (drive / "docs" / "a.txt").write_text("apagar")  # delete vai funcionar
+    (drive / "docs" / "b.txt").write_text("origem")
+    (drive / "destino").mkdir()
+    (drive / "destino" / "b.txt").write_text("ja existe")  # move vai dar conflito
+
+    db.execute(
+        "INSERT INTO pending_ops (snapshot_id, op_type, src_path, dst_path, created_at)"
+        " VALUES (?, 'delete', 'docs/a.txt', NULL, '2025-01-01T00:00:00')",
+        (snap_id,),
+    )
+    db.execute(
+        "INSERT INTO pending_ops (snapshot_id, op_type, src_path, dst_path, created_at)"
+        " VALUES (?, 'move', 'docs/b.txt', 'destino/b.txt', '2025-01-01T00:00:01')",
+        (snap_id,),
+    )
+    db.commit()
+
+    args = types.SimpleNamespace(snapshot_id=snap_id, mount_path=str(drive), dry_run=False)
+    with patch("builtins.input", return_value="s"):
+        ds.cmd_apply(args)
+
+    restantes = db.execute(
+        "SELECT op_type FROM pending_ops WHERE snapshot_id = ?", (snap_id,)
+    ).fetchall()
+    tipos = [r["op_type"] for r in restantes]
+    assert tipos == ["move"], "apenas o move em conflito deve restar; delete foi aplicado"
+    assert not (drive / "docs" / "a.txt").exists(), "delete deveria ter sido aplicado"
 
 
 # ---------------------------------------------------------------------------
@@ -409,3 +449,172 @@ def test_resume_totals_accumulated(tmp_db, capsys):
     assert existing_stats["total"] == 512, (
         "initial_size deve ser 512 para não zerar o progresso ao retomar"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14: quick_fingerprint
+# ---------------------------------------------------------------------------
+
+def test_quick_fingerprint_consistency(tmp_path):
+    """Mesma conteúdo → mesma fingerprint; conteúdo diferente → fingerprint diferente."""
+    a = tmp_path / "a.bin"
+    b = tmp_path / "b.bin"
+    c = tmp_path / "c.bin"
+    a.write_bytes(b"x" * 200000)
+    b.write_bytes(b"x" * 200000)  # idêntico a 'a'
+    c.write_bytes(b"y" * 200000)  # diferente
+
+    fa = ds.quick_fingerprint(str(a), a.stat().st_size)
+    fb = ds.quick_fingerprint(str(b), b.stat().st_size)
+    fc = ds.quick_fingerprint(str(c), c.stat().st_size)
+
+    assert fa == fb, "arquivos idênticos devem ter a mesma fingerprint"
+    assert fa != fc, "arquivos diferentes devem ter fingerprints diferentes"
+    assert fa.startswith("200000:"), "fingerprint deve embutir o tamanho"
+
+
+def test_quick_fingerprint_inaccessible(tmp_path):
+    """Arquivo inexistente retorna None em vez de levantar."""
+    assert ds.quick_fingerprint(str(tmp_path / "nao_existe"), 0) is None
+
+
+# ---------------------------------------------------------------------------
+# 15: _detect_jobs
+# ---------------------------------------------------------------------------
+
+def test_detect_jobs_respects_requested(tmp_path):
+    """--jobs explícito (>0) é sempre respeitado, sem consultar lsblk."""
+    assert ds._detect_jobs(str(tmp_path), 4) == 4
+    assert ds._detect_jobs(str(tmp_path), 1) == 1
+
+
+def test_detect_jobs_auto_is_positive(tmp_path):
+    """Modo auto (0) sempre retorna pelo menos 1 thread."""
+    assert ds._detect_jobs(str(tmp_path), 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# 16: snapshot --quick popula quick_hash e detecta duplicatas
+# ---------------------------------------------------------------------------
+
+def test_snapshot_quick_mode(tmp_path, tmp_db, capsys):
+    """--quick grava quick_hash (não sha256) e duplicates encontra cópias."""
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    (drive / "dup1.bin").write_bytes(b"z" * 200000)
+    (drive / "dup2.bin").write_bytes(b"z" * 200000)  # cópia idêntica
+    (drive / "unico.bin").write_bytes(b"w" * 200000)
+
+    args = types.SimpleNamespace(
+        path=str(drive), label="quick_drive", no_hash=False, quick=True, jobs=1,
+    )
+    ds.cmd_snapshot(args)
+
+    db = ds.get_db()
+    rows = db.execute("SELECT sha256, quick_hash FROM files").fetchall()
+    assert len(rows) == 3
+    assert all(r["sha256"] is None for r in rows), "modo quick não deve gravar sha256"
+    assert all(r["quick_hash"] for r in rows), "modo quick deve gravar quick_hash"
+
+    dup_args = types.SimpleNamespace(across=False, limit=50)
+    ds.cmd_duplicates(dup_args)
+    out = capsys.readouterr().out
+    assert "1 grupo" in out, "deve achar 1 grupo de duplicatas via quick_hash"
+
+
+# ---------------------------------------------------------------------------
+# 17: update reaproveita hashes inalterados
+# ---------------------------------------------------------------------------
+
+def test_update_reuses_unchanged_hashes(tmp_path, tmp_db):
+    """update reusa o sha256 de arquivos inalterados e re-hasheia os que mudaram."""
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    (drive / "a.txt").write_text("conteudo A")
+    (drive / "b.txt").write_text("conteudo B original")
+
+    # Snapshot base com hash completo
+    snap_args = types.SimpleNamespace(
+        path=str(drive), label="base", no_hash=False, quick=False, jobs=1,
+    )
+    ds.cmd_snapshot(snap_args)
+    db = ds.get_db()
+    base_id = db.execute("SELECT id FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    base_files = {r["path"]: r["sha256"] for r in db.execute(
+        "SELECT path, sha256 FROM files WHERE snapshot_id = ?", (base_id,)).fetchall()}
+
+    # Modifica b, adiciona c (a permanece igual)
+    (drive / "b.txt").write_text("conteudo B MODIFICADO")
+    (drive / "c.txt").write_text("novo arquivo C")
+
+    upd_args = types.SimpleNamespace(
+        snapshot_id=base_id, path=str(drive), label=None,
+        no_hash=False, quick=False, jobs=1,
+    )
+    ds.cmd_update(upd_args)
+
+    new_id = db.execute("SELECT id FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    assert new_id != base_id, "update deve criar um snapshot novo"
+    new_files = {r["path"]: r["sha256"] for r in db.execute(
+        "SELECT path, sha256 FROM files WHERE snapshot_id = ?", (new_id,)).fetchall()}
+
+    assert new_files["a.txt"] == base_files["a.txt"], "a.txt inalterado deve manter o hash"
+    assert new_files["b.txt"] != base_files["b.txt"], "b.txt modificado deve ter hash novo"
+    assert "c.txt" in new_files, "c.txt novo deve estar no snapshot"
+
+
+# ---------------------------------------------------------------------------
+# 18: update --quick reaproveita quick_hash de base feita com --quick
+# ---------------------------------------------------------------------------
+
+def test_update_quick_reuses_without_reading(tmp_path, tmp_db, monkeypatch):
+    """update --quick de uma base --quick não deve reler arquivos inalterados."""
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    (drive / "a.bin").write_bytes(b"a" * 200000)
+    (drive / "b.bin").write_bytes(b"b" * 200000)
+
+    ds.cmd_snapshot(types.SimpleNamespace(
+        path=str(drive), label="qbase", no_hash=False, quick=True, jobs=1))
+    db = ds.get_db()
+    base_id = db.execute("SELECT id FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    # Nenhum arquivo muda. Se o reuso funcionar, quick_fingerprint não é chamado.
+    calls = []
+    real_fp = ds.quick_fingerprint
+    monkeypatch.setattr(ds, "quick_fingerprint", lambda *a, **k: calls.append(a) or real_fp(*a, **k))
+
+    ds.cmd_update(types.SimpleNamespace(
+        snapshot_id=base_id, path=str(drive), label=None,
+        no_hash=False, quick=True, jobs=1))
+
+    assert calls == [], "arquivos inalterados não deveriam ser relidos no update --quick"
+
+
+# ---------------------------------------------------------------------------
+# 19: export inclui quick_hash
+# ---------------------------------------------------------------------------
+
+def test_export_includes_quick_hash(tmp_path, tmp_db, monkeypatch):
+    """export CSV de snapshot --quick deve trazer a coluna quick_hash preenchida."""
+    db = ds.get_db()
+    cur = db.execute(
+        "INSERT INTO snapshots (label, mount_path, created_at, total_files, total_size, status)"
+        " VALUES ('exp', '/mnt/exp', '2025-01-01T00:00:00', 1, 100, 'complete')"
+    )
+    snap_id = cur.lastrowid
+    db.execute(
+        "INSERT INTO files (snapshot_id, path, size, mtime, sha256, quick_hash)"
+        " VALUES (?, 'f.bin', 100, 0, NULL, '100:deadbeefdeadbeef')",
+        (snap_id,),
+    )
+    db.commit()
+
+    monkeypatch.chdir(tmp_path)  # escreve o CSV no tmp
+    ds.cmd_export(types.SimpleNamespace(snapshot_id=snap_id, format="csv"))
+
+    csv_files = list(tmp_path.glob("*.csv"))
+    assert csv_files, "deve ter gerado um CSV"
+    content = csv_files[0].read_text()
+    assert "quick_hash" in content.splitlines()[0], "cabeçalho deve ter quick_hash"
+    assert "100:deadbeefdeadbeef" in content, "valor de quick_hash deve estar no CSV"

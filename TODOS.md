@@ -24,9 +24,18 @@
 - [x] UX: Search com regex (`--regex` flag)
 - [x] UX: Duplicates summary header (total grupos + cópias extras + espaço desperdiçado)
 
+## Concluídos (v2.1 — 2026-06-18)
+
+### Performance & resiliência
+- [x] Fix CRÍTICO: apply só remove de pending_ops as ops bem-sucedidas (conflitos/erros ficam para retry)
+- [x] Fix: rmdir aninhado removido do mais profundo pro mais raso (evita ENOTEMPTY)
+- [x] Fix: vazamento de conexão em _migrate_db
+- [x] Perf: hashing paralelo `--jobs N` (auto-detecta HD mecânico vs SSD via lsblk ROTA)
+- [x] Perf: `--quick` fingerprint (size + 64KB de bordas) — coluna quick_hash, duplicates/compare via COALESCE
+- [x] Phase 1.2: Incremental snapshots (`update` command) — reaproveita hashes inalterados
+
 ## Próximos Passos (task_plan.md)
 
-- [ ] Phase 1.2: Incremental snapshots (`update` command)
 - [ ] Phase 1.3: Verify / bitrot detection (`verify` command)
 - [ ] Phase 1.5: rsync-based apply (`--rsync` flag)
 - [ ] Phase 2.1: Smart dedup assistant (`dedup` command)

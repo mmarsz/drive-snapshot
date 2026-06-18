@@ -5,6 +5,8 @@ Cria snapshots com hashes para encontrar duplicatas entre drives.
 
 Uso:
   ./drive-snapshot.py snapshot <caminho> [--label NOME]   Escaneia um drive montado
+                       [--quick] [--jobs N]                (--quick=fingerprint rápida, --jobs=threads)
+  ./drive-snapshot.py update <snapshot_id> [caminho]       Snapshot incremental (reusa hashes)
   ./drive-snapshot.py list                                 Lista todos os snapshots
   ./drive-snapshot.py files <snapshot_id> [--sort size]    Lista arquivos de um snapshot
   ./drive-snapshot.py search <pattern>                     Busca arquivos por nome
@@ -28,7 +30,8 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -108,11 +111,13 @@ def get_db():
             size INTEGER NOT NULL,
             mtime REAL,
             sha256 TEXT,
+            quick_hash TEXT,
             FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_snapshot ON files(snapshot_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(sha256)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_quick ON files(quick_hash)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
     db.execute("""
         CREATE TABLE IF NOT EXISTS pending_ops (
@@ -136,6 +141,12 @@ def _migrate_db(db):
     if "status" not in cols:
         db.execute("ALTER TABLE snapshots ADD COLUMN status TEXT DEFAULT 'complete'")
         db.commit()
+    # quick_hash: impressão digital barata para o modo --quick
+    file_cols = {row[1] for row in db.execute("PRAGMA table_info(files)").fetchall()}
+    if "quick_hash" not in file_cols:
+        db.execute("ALTER TABLE files ADD COLUMN quick_hash TEXT")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_quick ON files(quick_hash)")
+        db.commit()
 
 
 # --- Helpers ---
@@ -151,6 +162,26 @@ def hash_file(filepath, chunk_size=1024 * 1024):
                     break
                 h.update(chunk)
         return h.hexdigest()
+    except (PermissionError, OSError):
+        return None
+
+
+def quick_fingerprint(filepath, size):
+    """Impressão digital barata: tamanho + sha256 dos primeiros e últimos 64KB.
+
+    Para arquivos grandes lê só 128KB em vez de gigabytes — muito mais rápido que
+    o SHA256 completo. Colisões são raras mas possíveis (dois arquivos de mesmo
+    tamanho e mesmas bordas, diferentes no meio); por isso é uma aproximação,
+    adequada ao modo --quick. Retorna string 'size:hash16' ou None se inacessível.
+    """
+    h = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            h.update(f.read(65536))
+            if size > 131072:
+                f.seek(-65536, os.SEEK_END)
+                h.update(f.read(65536))
+        return f"{size}:{h.hexdigest()[:16]}"
     except (PermissionError, OSError):
         return None
 
@@ -179,61 +210,86 @@ class _ScanState:
     """Estado mutável compartilhado durante o scan de arquivos."""
     total_size: int = 0
     hashed: int = 0
+    reused: int = 0      # hashes reaproveitados de um snapshot anterior (update)
     skipped: int = 0
     batch: list = field(default_factory=list)
     interrupted: bool = False
 
 
-def cmd_snapshot(args):
+def _detect_label(mount):
+    """Auto-detecta o label do filesystem via lsblk/findmnt; fallback = basename."""
+    try:
+        result = subprocess.run(
+            ['lsblk', '-no', 'LABEL', mount],
+            capture_output=True, text=True, timeout=5,
+        )
+        detected = result.stdout.strip()
+        if detected:
+            return detected
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return os.path.basename(mount) or mount
+    # lsblk falha em subdiretórios — resolve o mount point real com findmnt
+    try:
+        mount_result = subprocess.run(
+            ['findmnt', '-no', 'TARGET', '--target', mount],
+            capture_output=True, text=True, timeout=5,
+        )
+        mount_point = mount_result.stdout.strip() or mount
+        result = subprocess.run(
+            ['lsblk', '-no', 'LABEL', mount_point],
+            capture_output=True, text=True, timeout=5,
+        )
+        detected = result.stdout.strip()
+        if detected:
+            return detected
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return os.path.basename(mount) or mount
+
+
+def _detect_jobs(mount, requested):
+    """Decide quantas threads usar para hashing.
+
+    requested > 0 → respeita. requested <= 0 (auto) → detecta se o dispositivo é
+    rotacional (HD mecânico) via `lsblk -no ROTA`. HD → 1 thread (leitura paralela
+    causa thrashing de seek). SSD/NVMe → paraleliza até min(8, CPUs).
+    Em caso de dúvida, assume HD (serial) por segurança.
+    """
+    if requested and requested > 0:
+        return requested
+    rotational = True  # default seguro: serial
+    try:
+        r = subprocess.run(
+            ['lsblk', '-no', 'ROTA', '--target', mount],
+            capture_output=True, text=True, timeout=5,
+        )
+        vals = [v.strip() for v in r.stdout.split() if v.strip()]
+        if vals:
+            rotational = any(v == '1' for v in vals)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    if rotational:
+        return 1
+    return min(8, os.cpu_count() or 2)
+
+
+def _scan_into_snapshot(args, mount, label, prior=None, new_snapshot=False):
+    """Núcleo de scan compartilhado por `snapshot` e `update`.
+
+    prior: dict opcional {relpath: (size, mtime, sha256)} de um snapshot anterior;
+           arquivos com mesmo size+mtime reaproveitam o hash (sem reler o arquivo).
+    new_snapshot: se True, sempre cria um snapshot novo (não tenta retomar) —
+           usado por `update` para preservar o histórico.
+    """
     logger = logging.getLogger("drive-snapshot")
-    mount = os.path.abspath(args.path)
-    if not os.path.isdir(mount):
-        print(f"Erro: '{mount}' não é um diretório válido.", file=sys.stderr)
-        sys.exit(1)
+    quick = getattr(args, "quick", False)
+    no_hash = getattr(args, "no_hash", False)
+    jobs = _detect_jobs(mount, getattr(args, "jobs", 0))
 
-    # Auto-detecta label do filesystem via lsblk se --label não fornecido
-    label = args.label
-    if not label:
-        try:
-            result = subprocess.run(
-                ['lsblk', '-no', 'LABEL', mount],
-                capture_output=True, text=True, timeout=5,
-            )
-            detected = result.stdout.strip()
-            if detected:
-                label = detected
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass  # lsblk não disponível, usa fallback
-    # Fix 4A: lsblk falha em subdiretórios — resolve o mount point real com findmnt
-    if not label:
-        try:
-            # findmnt retorna o ponto de montagem exato do dispositivo que contém o caminho
-            mount_result = subprocess.run(
-                ['findmnt', '-no', 'TARGET', '--target', mount],
-                capture_output=True, text=True, timeout=5,
-            )
-            mount_point = mount_result.stdout.strip() or mount
-            result = subprocess.run(
-                ['lsblk', '-no', 'LABEL', mount_point],
-                capture_output=True, text=True, timeout=5,
-            )
-            detected = result.stdout.strip()
-            if detected:
-                label = detected
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass  # findmnt ou lsblk não disponíveis
-    if not label:
-        label = os.path.basename(mount) or mount
-    print(f"Escaneando: {mount}")
-    print(f"Label: {label}")
-    logger.info(f"Iniciando snapshot: path={mount} label={label}")
-
-    # Callback para erros de acesso durante os.walk (ex.: nomes não-UTF-8 em NTFS/exFAT)
     def walk_error(err):
         print(f"\n  AVISO: não foi possível acessar: {err.filename} ({err})", file=sys.stderr)
         logger.warning(f"Erro de acesso durante walk: {err.filename} ({err})")
 
-    # Primeira passada: contar arquivos para barra de progresso
     print("Contando arquivos...", end="", flush=True)
     file_list = []
     for root, dirs, filenames in os.walk(mount, onerror=walk_error):
@@ -242,7 +298,8 @@ def cmd_snapshot(args):
             if os.path.isfile(fpath) and not os.path.islink(fpath):
                 file_list.append(fpath)
     total = len(file_list)
-    print(f" {total} arquivos encontrados.")
+    mode_desc = "quick" if quick else ("sem hash" if no_hash else "sha256")
+    print(f" {total} arquivos encontrados. (modo: {mode_desc}, jobs: {jobs})")
 
     if total == 0:
         print("Nenhum arquivo encontrado. Nada a fazer.")
@@ -251,30 +308,31 @@ def cmd_snapshot(args):
 
     db = get_db()
 
-    # Verifica se há snapshot interrompido com mesmo label+mount para retomar
+    # Retoma snapshot interrompido com mesmo label+mount (exceto em update)
     already_scanned = set()
-    existing = db.execute(
-        "SELECT id FROM snapshots WHERE label = ? AND mount_path = ? AND status IN ('scanning', 'interrupted')",
-        (label, mount),
-    ).fetchone()
+    initial_size = 0
+    initial_hashed = 0
+    existing = None
+    if not new_snapshot:
+        existing = db.execute(
+            "SELECT id FROM snapshots WHERE label = ? AND mount_path = ? AND status IN ('scanning', 'interrupted')",
+            (label, mount),
+        ).fetchone()
     if existing:
         snap_id = existing["id"]
-        # Carrega paths já escaneados para pular
         already_scanned = {
             r["path"] for r in db.execute(
                 "SELECT path FROM files WHERE snapshot_id = ?", (snap_id,)
             ).fetchall()
         }
-        # Fix 2A: carrega totais já acumulados para não zerar ao retomar
-        existing_stats = db.execute(
+        stats = db.execute(
             "SELECT COUNT(*) as cnt, COALESCE(SUM(size), 0) as total FROM files WHERE snapshot_id = ?",
-            (snap_id,)
+            (snap_id,),
         ).fetchone()
-        initial_size = existing_stats["total"]
-        # Conta hashes já computados (sha256 não-nulo)
+        initial_size = stats["total"]
         initial_hashed = db.execute(
             "SELECT COUNT(*) as cnt FROM files WHERE snapshot_id = ? AND sha256 IS NOT NULL",
-            (snap_id,)
+            (snap_id,),
         ).fetchone()["cnt"]
         print(f"  Retomando snapshot #{snap_id} ({len(already_scanned)} arquivos já escaneados)")
         logger.info(f"Retomando snapshot #{snap_id} com {len(already_scanned)} arquivos já escaneados")
@@ -285,63 +343,100 @@ def cmd_snapshot(args):
         )
         snap_id = cur.lastrowid
         db.commit()
-        initial_size = 0
-        initial_hashed = 0
+
+    # Pré-filtra arquivos já escaneados (resume) — barato e melhora o paralelismo
+    if already_scanned:
+        pending = [f for f in file_list if os.path.relpath(f, mount) not in already_scanned]
+    else:
+        pending = file_list
+    n_pending = len(pending)
 
     batch_size = 500
     start = time.time()
+    state = _ScanState(total_size=initial_size, hashed=initial_hashed)
 
-    # Fix 6A: estado mutável em dataclass para evitar corrida em closures com nonlocal
-    state = _ScanState(
-        total_size=initial_size,
-        hashed=initial_hashed,
-    )
-
-    # Fix 1A: handler apenas sinaliza a flag; o loop é quem persiste e sai
     def _handle_sigint(signum, frame):
         state.interrupted = True
 
     old_handler = signal.signal(signal.SIGINT, _handle_sigint)
 
-    def _process_file(fpath, i):
-        """Processa um arquivo: stat + hash + acumula no batch."""
+    def _scan_one(fpath):
+        """Worker puro (sem DB): stat + hash/fingerprint. Roda em threads."""
         try:
             relpath = os.path.relpath(fpath, mount)
-            # Pula arquivos já escaneados (resume)
-            if relpath in already_scanned:
-                return
-
-            stat_info = os.stat(fpath)
-            size = stat_info.st_size
-            mtime = stat_info.st_mtime
-
-            if args.no_hash:
-                sha = None
-            else:
-                sha = hash_file(fpath)
-                if sha:
-                    state.hashed += 1
-
-            state.total_size += size
-            state.batch.append((snap_id, relpath, size, mtime, sha))
+            st = os.stat(fpath)
+            size, mtime = st.st_size, st.st_mtime
+            sha = q = None
+            reused = False
+            # prior = {relpath: (size, mtime, sha256, quick_hash)} de um snapshot anterior
+            old = prior.get(relpath) if prior is not None else None
+            unchanged = bool(old and old[0] == size and old[1] == mtime)
+            if quick:
+                if unchanged and old[3]:
+                    q, reused = old[3], True
+                else:
+                    q = quick_fingerprint(fpath, size)
+            elif not no_hash:
+                if unchanged and old[2]:
+                    sha, reused = old[2], True
+                else:
+                    sha = hash_file(fpath)
+            return ("row", relpath, size, mtime, sha, q, reused)
         except (UnicodeDecodeError, OSError) as e:
-            logger.debug(f"Arquivo ignorado (inacessível): {fpath} — {e}")
+            return ("err", fpath, e)
+
+    def _consume(result):
+        kind = result[0]
+        if kind == "err":
+            logger.debug(f"Arquivo ignorado (inacessível): {result[1]} — {result[2]}")
             state.skipped += 1
             return
-
+        _, relpath, size, mtime, sha, q, reused = result
+        state.total_size += size
+        if reused:
+            state.reused += 1
+        elif sha:
+            state.hashed += 1
+        state.batch.append((snap_id, relpath, size, mtime, sha, q))
         if len(state.batch) >= batch_size:
             db.executemany(
-                "INSERT INTO files (snapshot_id, path, size, mtime, sha256) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO files (snapshot_id, path, size, mtime, sha256, quick_hash) VALUES (?, ?, ?, ?, ?, ?)",
                 state.batch,
             )
             db.commit()
             state.batch.clear()
-            # Fix 1A: verifica interrupção após cada commit para sair limpo do próximo ciclo
-            # (o loop externo também checa state.interrupted antes de chamar _process_file)
 
-    # Função de progresso com rich (se disponível) ou fallback \r
+    def _results():
+        """Itera resultados; serial (jobs<=1) ou via thread pool com janela limitada.
+
+        Mantém no máximo 2*jobs hashes em voo em vez de submeter o drive inteiro de
+        uma vez. Isso limita quanto trabalho continua rodando após um Ctrl+C: ao sair
+        do `with`, o shutdown(wait=True) espera só esses poucos futures, então a
+        interrupção é rápida em vez de aguardar milhares de hashes já submetidos
+        (threads do pool não são daemon e bloqueiam o sys.exit).
+        """
+        if jobs <= 1:
+            for f in pending:
+                if state.interrupted:
+                    return
+                yield _scan_one(f)
+            return
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            src = iter(pending)
+            inflight = deque()
+            for f in src:
+                inflight.append(ex.submit(_scan_one, f))
+                if len(inflight) >= jobs * 2:
+                    break
+            while inflight:
+                yield inflight.popleft().result()
+                if state.interrupted:
+                    break
+                nxt = next(src, None)
+                if nxt is not None:
+                    inflight.append(ex.submit(_scan_one, nxt))
+
     def _run_scan_loop():
-        """Itera sobre file_list chamando _process_file; para se state.interrupted."""
         if _RICH_AVAILABLE:
             with Progress(
                 SpinnerColumn(),
@@ -353,23 +448,23 @@ def cmd_snapshot(args):
                 TextColumn("•"),
                 TimeRemainingColumn(),
             ) as progress:
-                task = progress.add_task("Escaneando", total=total, size="0 B")
-                for i, fpath in enumerate(file_list, 1):
+                task = progress.add_task("Escaneando", total=n_pending, size="0 B")
+                for res in _results():
                     if state.interrupted:
                         break
-                    _process_file(fpath, i)
+                    _consume(res)
                     progress.update(task, advance=1, size=fmt_size(state.total_size))
         else:
-            for i, fpath in enumerate(file_list, 1):
+            for i, res in enumerate(_results(), 1):
                 if state.interrupted:
                     break
-                _process_file(fpath, i)
-                if i % 100 == 0 or i == total:
+                _consume(res)
+                if i % 100 == 0 or i == n_pending:
                     elapsed = time.time() - start
                     rate = i / elapsed if elapsed > 0 else 0
-                    eta = (total - i) / rate if rate > 0 else 0
+                    eta = (n_pending - i) / rate if rate > 0 else 0
                     print(
-                        f"\r  [{i}/{total}] {i*100//total}% | "
+                        f"\r  [{i}/{n_pending}] {i*100//n_pending}% | "
                         f"{fmt_size(state.total_size)} | "
                         f"{rate:.0f} arq/s | "
                         f"ETA: {eta:.0f}s   ",
@@ -379,21 +474,19 @@ def cmd_snapshot(args):
 
     _run_scan_loop()
 
-    # Restaura handler original de SIGINT
     signal.signal(signal.SIGINT, old_handler)
 
-    # Fix 1A: flush do batch restante e status dependem de ter sido interrompido ou não
     if state.batch:
         db.executemany(
-            "INSERT INTO files (snapshot_id, path, size, mtime, sha256) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO files (snapshot_id, path, size, mtime, sha256, quick_hash) VALUES (?, ?, ?, ?, ?, ?)",
             state.batch,
         )
 
+    files_done = total - state.skipped
     if state.interrupted:
-        # Salva progresso parcial e sai com código 130 (convenção Ctrl+C)
         db.execute(
             "UPDATE snapshots SET total_files = ?, total_size = ?, status = 'interrupted' WHERE id = ?",
-            (total - state.skipped, state.total_size, snap_id),
+            (files_done, state.total_size, snap_id),
         )
         db.commit()
         logger.info(f"Snapshot #{snap_id} interrompido pelo usuário. Progresso salvo.")
@@ -402,20 +495,70 @@ def cmd_snapshot(args):
 
     db.execute(
         "UPDATE snapshots SET total_files = ?, total_size = ?, status = 'complete' WHERE id = ?",
-        (total - state.skipped, state.total_size, snap_id),
+        (files_done, state.total_size, snap_id),
     )
     db.commit()
 
     elapsed = time.time() - start
     print(f"\n\nSnapshot #{snap_id} criado!")
-    print(f"  Arquivos: {total - state.skipped} ({state.skipped} inacessíveis)")
+    print(f"  Arquivos: {files_done} ({state.skipped} inacessíveis)")
     print(f"  Tamanho total: {fmt_size(state.total_size)}")
-    print(f"  Hasheados: {state.hashed}")
+    if quick:
+        print(f"  Fingerprints (quick): {files_done}")
+    else:
+        print(f"  Hasheados: {state.hashed}" + (f" (+{state.reused} reaproveitados)" if state.reused else ""))
     print(f"  Tempo: {elapsed:.1f}s")
     logger.info(
-        f"Snapshot #{snap_id} concluído: {total - state.skipped} arquivos, "
-        f"{fmt_size(state.total_size)}, {state.skipped} inacessíveis, {elapsed:.1f}s"
+        f"Snapshot #{snap_id} concluído: {files_done} arquivos, {fmt_size(state.total_size)}, "
+        f"{state.skipped} inacessíveis, {state.hashed} hash, {state.reused} reaproveitados, {elapsed:.1f}s"
     )
+    return snap_id
+
+
+def cmd_snapshot(args):
+    logger = logging.getLogger("drive-snapshot")
+    mount = os.path.abspath(args.path)
+    if not os.path.isdir(mount):
+        print(f"Erro: '{mount}' não é um diretório válido.", file=sys.stderr)
+        sys.exit(1)
+
+    label = args.label or _detect_label(mount)
+    print(f"Escaneando: {mount}")
+    print(f"Label: {label}")
+    logger.info(f"Iniciando snapshot: path={mount} label={label}")
+    _scan_into_snapshot(args, mount, label)
+
+
+def cmd_update(args):
+    """Snapshot incremental: reaproveita hashes de um snapshot anterior para os
+    arquivos inalterados (mesmo path+size+mtime), re-hasheando só o que mudou."""
+    logger = logging.getLogger("drive-snapshot")
+    db = get_db()
+    base = db.execute("SELECT * FROM snapshots WHERE id = ?", (args.snapshot_id,)).fetchone()
+    if not base:
+        print(f"Snapshot #{args.snapshot_id} não encontrado.", file=sys.stderr)
+        sys.exit(1)
+
+    mount = os.path.abspath(args.path) if args.path else base["mount_path"]
+    if not os.path.isdir(mount):
+        print(f"Erro: '{mount}' não é um diretório válido (drive desconectado?).", file=sys.stderr)
+        sys.exit(1)
+
+    label = args.label or base["label"]
+
+    # Carrega o snapshot-base como mapa relpath -> (size, mtime, sha256, quick_hash)
+    prior = {
+        r["path"]: (r["size"], r["mtime"], r["sha256"], r["quick_hash"])
+        for r in db.execute(
+            "SELECT path, size, mtime, sha256, quick_hash FROM files WHERE snapshot_id = ?",
+            (args.snapshot_id,),
+        ).fetchall()
+    }
+    print(f"Atualizando a partir do snapshot #{base['id']} '{base['label']}' ({len(prior)} arquivos base)")
+    print(f"Escaneando: {mount}")
+    print(f"Label: {label}")
+    logger.info(f"Iniciando update: base=#{base['id']} path={mount} label={label} base_files={len(prior)}")
+    _scan_into_snapshot(args, mount, label, prior=prior, new_snapshot=True)
 
 
 def cmd_list(args):
@@ -537,11 +680,14 @@ def cmd_duplicates(args):
     having = "HAVING COUNT(DISTINCT snapshot_id) > 1" if args.across else "HAVING COUNT(*) > 1"
     desc = "entre drives diferentes" if args.across else "em todos os snapshots"
 
+    # Chave de conteúdo: sha256 quando disponível, senão a fingerprint do modo --quick.
+    # Os dois nunca colidem entre si (hex de 64 chars vs 'size:hash16').
     base_query = f"""
-        SELECT sha256, size, COUNT(*) as cnt, COUNT(DISTINCT snapshot_id) as snap_cnt
+        SELECT COALESCE(sha256, quick_hash) as ck, size, COUNT(*) as cnt,
+               COUNT(DISTINCT snapshot_id) as snap_cnt
         FROM files
-        WHERE sha256 IS NOT NULL
-        GROUP BY sha256
+        WHERE COALESCE(sha256, quick_hash) IS NOT NULL
+        GROUP BY ck
         {having}
         ORDER BY size DESC
     """
@@ -571,23 +717,23 @@ def cmd_duplicates(args):
     display_rows = db.execute(display_query, (limit,)).fetchall()
 
     # Busca todas as localizações de uma vez (evita N+1 queries)
-    all_hashes = [r["sha256"] for r in display_rows]
+    all_hashes = [r["ck"] for r in display_rows]
     locs_by_hash = defaultdict(list)
     if all_hashes:
         placeholders = ",".join("?" * len(all_hashes))
         locations = db.execute(f"""
-            SELECT f.sha256, f.path, s.label, s.id as snap_id
+            SELECT COALESCE(f.sha256, f.quick_hash) as ck, f.path, s.label, s.id as snap_id
             FROM files f JOIN snapshots s ON f.snapshot_id = s.id
-            WHERE f.sha256 IN ({placeholders})
-            ORDER BY f.sha256, s.label, f.path
+            WHERE COALESCE(f.sha256, f.quick_hash) IN ({placeholders})
+            ORDER BY ck, s.label, f.path
         """, all_hashes).fetchall()
         for loc in locations:
-            locs_by_hash[loc["sha256"]].append(loc)
+            locs_by_hash[loc["ck"]].append(loc)
 
     shown = 0
     for r in display_rows:
-        print(f"  Hash: {r['sha256'][:16]}…  Tamanho: {fmt_size(r['size'])}  Cópias: {r['cnt']} (em {r['snap_cnt']} snapshot(s))")
-        for loc in locs_by_hash[r["sha256"]]:
+        print(f"  Hash: {r['ck'][:16]}…  Tamanho: {fmt_size(r['size'])}  Cópias: {r['cnt']} (em {r['snap_cnt']} snapshot(s))")
+        for loc in locs_by_hash[r["ck"]]:
             print(f"    [{loc['label']}#{loc['snap_id']}] {loc['path']}")
         print()
         shown += 1
@@ -607,15 +753,16 @@ def cmd_compare(args):
 
     print(f"Comparando: #{s1['id']} {s1['label']}  vs  #{s2['id']} {s2['label']}\n")
 
-    # Arquivos por hash em cada snapshot
+    # Arquivos por chave de conteúdo (sha256 ou, no modo --quick, quick_hash)
     def get_hashes(snap_id):
         rows = db.execute(
-            "SELECT sha256, path, size FROM files WHERE snapshot_id = ? AND sha256 IS NOT NULL",
+            "SELECT COALESCE(sha256, quick_hash) as ck, path, size FROM files "
+            "WHERE snapshot_id = ? AND COALESCE(sha256, quick_hash) IS NOT NULL",
             (snap_id,),
         ).fetchall()
         by_hash = {}
         for r in rows:
-            by_hash.setdefault(r["sha256"], []).append(r)
+            by_hash.setdefault(r["ck"], []).append(r)
         return by_hash
 
     h1 = get_hashes(args.id1)
@@ -641,14 +788,14 @@ def cmd_compare(args):
     paths1 = {r["path"]: r for rows in h1.values() for r in rows}
     paths2 = {r["path"]: r for rows in h2.values() for r in rows}
     common_paths = set(paths1.keys()) & set(paths2.keys())
-    changed = [(p, paths1[p], paths2[p]) for p in common_paths if paths1[p]["sha256"] != paths2[p]["sha256"]]
+    changed = [(p, paths1[p], paths2[p]) for p in common_paths if paths1[p]["ck"] != paths2[p]["ck"]]
 
     if changed:
         print(f"\n  Mesmo caminho, conteúdo diferente: {len(changed)}")
         for p, f1, f2 in changed[:20]:
             print(f"    {p}")
-            print(f"      #{s1['id']}: {fmt_size(f1['size'])}  {f1['sha256'][:12]}…")
-            print(f"      #{s2['id']}: {fmt_size(f2['size'])}  {f2['sha256'][:12]}…")
+            print(f"      #{s1['id']}: {fmt_size(f1['size'])}  {f1['ck'][:12]}…")
+            print(f"      #{s2['id']}: {fmt_size(f2['size'])}  {f2['ck'][:12]}…")
         if len(changed) > 20:
             print(f"    ... e mais {len(changed) - 20}")
 
@@ -661,7 +808,7 @@ def cmd_export(args):
         sys.exit(1)
 
     rows = db.execute(
-        "SELECT path, size, mtime, sha256 FROM files WHERE snapshot_id = ? ORDER BY path",
+        "SELECT path, size, mtime, sha256, quick_hash FROM files WHERE snapshot_id = ? ORDER BY path",
         (args.snapshot_id,),
     ).fetchall()
 
@@ -670,9 +817,9 @@ def cmd_export(args):
         outfile = f"snapshot_{args.snapshot_id}_{snap['label']}.csv"
         with open(outfile, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["path", "size", "mtime", "sha256"])
+            w.writerow(["path", "size", "mtime", "sha256", "quick_hash"])
             for r in rows:
-                w.writerow([r["path"], r["size"], r["mtime"], r["sha256"]])
+                w.writerow([r["path"], r["size"], r["mtime"], r["sha256"], r["quick_hash"]])
         print(f"Exportado: {outfile}")
     else:
         outfile = f"snapshot_{args.snapshot_id}_{snap['label']}.json"
@@ -1048,6 +1195,18 @@ def cmd_apply(args):
         (args.snapshot_id,),
     ).fetchall()
 
+    # Desempate por profundidade: rmdir do mais fundo pro mais raso (senão o pai
+    # é removido antes do filho e dá ENOTEMPTY); mkdir do mais raso pro mais fundo.
+    _PRIO = {"mkdir": 1, "move": 2, "delete": 3, "rmdir": 4}
+
+    def _depth_key(r):
+        depth = (r["src_path"] or "").count("/")
+        if r["op_type"] == "rmdir":
+            depth = -depth  # mais profundo primeiro
+        return (_PRIO.get(r["op_type"], 5), depth, r["created_at"])
+
+    rows = sorted(rows, key=_depth_key)
+
     if not rows:
         print("Nenhuma operação pendente para este snapshot.")
         return
@@ -1083,6 +1242,7 @@ def cmd_apply(args):
     ok = 0
     erros = 0
     conflitos = 0  # destino já existe antes do move
+    applied_ids = []  # só operações concluídas são removidas de pending_ops
     for r in rows:
         op_type = r["op_type"]
         src_path = r["src_path"]
@@ -1153,17 +1313,29 @@ def cmd_apply(args):
                 else:
                     print(f"  SKIP (não encontrado): {src_path}")
             ok += 1
+            applied_ids.append(r["id"])
         except Exception as e:
             print(f"  ERRO: {op_type} {src_path}: {e}")
             logger.warning(f"APPLY #{snap_id}: {op_type} {src_path} FAILED: {e}")
             erros += 1
 
-    # Limpa operações aplicadas
-    db.execute("DELETE FROM pending_ops WHERE snapshot_id = ?", (args.snapshot_id,))
-    db.commit()
+    # Limpa SOMENTE as operações concluídas com sucesso. Conflitos e erros
+    # permanecem em pending_ops para que possam ser revistos/reaplicados depois.
+    if applied_ids:
+        placeholders = ",".join("?" * len(applied_ids))
+        db.execute(
+            f"DELETE FROM pending_ops WHERE id IN ({placeholders})", applied_ids
+        )
+        db.commit()
 
+    restantes = len(rows) - len(applied_ids)
     print(f"\nConcluído: {ok} ok, {erros} erros, {conflitos} conflitos.")
-    logger.info(f"APPLY #{snap_id}: concluído - {ok} ok, {erros} erros, {conflitos} conflitos")
+    if restantes:
+        print(f"  {restantes} operação(ões) mantida(s) como pendente(s) para retry.")
+    logger.info(
+        f"APPLY #{snap_id}: concluído - {ok} ok, {erros} erros, "
+        f"{conflitos} conflitos, {restantes} mantidas pendentes"
+    )
 
 
 def cmd_delete(args):
@@ -1203,6 +1375,19 @@ def main():
     p.add_argument("path", help="Caminho do ponto de montagem")
     p.add_argument("--label", "-l", help="Nome/label do drive (ex: 'HD-Fotos')")
     p.add_argument("--no-hash", action="store_true", help="Pula o cálculo de SHA256 (mais rápido)")
+    p.add_argument("--quick", action="store_true",
+                   help="Fingerprint barata (size + bordas de 64KB) em vez de SHA256 completo — muito mais rápido, duplicatas aproximadas")
+    p.add_argument("--jobs", "-j", type=int, default=0,
+                   help="Threads de hashing (0=auto: 1 em HD mecânico, N em SSD/NVMe)")
+
+    # update
+    p = sub.add_parser("update", help="Snapshot incremental (reaproveita hashes inalterados)")
+    p.add_argument("snapshot_id", type=int, help="Snapshot-base a partir do qual reaproveitar hashes")
+    p.add_argument("path", nargs="?", help="Caminho do drive (default: mount_path do snapshot-base)")
+    p.add_argument("--label", "-l", help="Label do novo snapshot (default: o do snapshot-base)")
+    p.add_argument("--no-hash", action="store_true", help="Pula o cálculo de SHA256")
+    p.add_argument("--quick", action="store_true", help="Fingerprint barata em vez de SHA256 completo")
+    p.add_argument("--jobs", "-j", type=int, default=0, help="Threads de hashing (0=auto)")
 
     # list
     sub.add_parser("list", help="Lista snapshots")
@@ -1261,10 +1446,13 @@ def main():
     _setup_logging(args.verbose)
 
     # Executa migrações de schema uma única vez por invocação
-    _migrate_db(get_db())
+    _mig_db = get_db()
+    _migrate_db(_mig_db)
+    _mig_db.close()
 
     {
         "snapshot": cmd_snapshot,
+        "update": cmd_update,
         "list": cmd_list,
         "files": cmd_files,
         "search": cmd_search,
