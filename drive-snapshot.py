@@ -117,8 +117,9 @@ def get_db():
     """)
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_snapshot ON files(snapshot_id)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(sha256)")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_files_quick ON files(quick_hash)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
+    # idx_files_quick NÃO é criado aqui: em bancos antigos a coluna quick_hash só
+    # existe após _migrate_db(). O índice é criado lá (idempotente p/ bancos novos).
     db.execute("""
         CREATE TABLE IF NOT EXISTS pending_ops (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,8 +146,11 @@ def _migrate_db(db):
     file_cols = {row[1] for row in db.execute("PRAGMA table_info(files)").fetchall()}
     if "quick_hash" not in file_cols:
         db.execute("ALTER TABLE files ADD COLUMN quick_hash TEXT")
-        db.execute("CREATE INDEX IF NOT EXISTS idx_files_quick ON files(quick_hash)")
         db.commit()
+    # Índice criado aqui (não em get_db) pois depende da coluna já existir.
+    # IF NOT EXISTS torna idempotente tanto p/ bancos novos quanto migrados.
+    db.execute("CREATE INDEX IF NOT EXISTS idx_files_quick ON files(quick_hash)")
+    db.commit()
 
 
 # --- Helpers ---
