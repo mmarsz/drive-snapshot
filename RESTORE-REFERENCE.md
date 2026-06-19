@@ -15,7 +15,8 @@ Legenda: ✅ já no backup (restaura) · 🔁 reinstalar do zero · ⚠️ aten�
 
 ## Dois drives de backup
 - **Kingston SA400 240GB** (`backup-home`, ext4) → **`/home` completo** + `system-extras/` (etc, usr/local, manifestos).
-- **Patriot P210 512GB** → **`/opt/Xilinx` (21 GB)** — salvo aqui porque não cabia no Kingston (2026-06-19).
+- **Patriot P210 512GB** (exfat "Ventoy") → **`/opt/Xilinx`** empacotado em `xilinx-opt-2026-06-19.tar` (20 GB, 254.607 itens, verificado). Não cabia no Kingston.
+  Restaurar: `sudo tar -xf /media/.../xilinx-opt-2026-06-19.tar -C /opt`  (tar preserva symlinks/perms que exfat não guarda).
 
 ## ⚠️ O que NÃO está no backup do /home (decisão sua)
 - ✅ **`/opt/Xilinx` (21 GB)** — salvo no **Patriot P210 512GB** (drive separado). Restaurar: copiar de volta pra `/opt/Xilinx`.
